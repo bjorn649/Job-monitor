@@ -17,8 +17,8 @@ sites:
   - tenderned
 
 email:
-  sender: ${EMAIL_SENDER}
-  password: ${EMAIL_PASSWORD}
+  sender: ""
+  password: ""
   recipient: bjorngrob1980@gmail.com
   smtp_host: smtp.gmail.com
   smtp_port: 587
