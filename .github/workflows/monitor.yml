@@ -11,6 +11,7 @@ permissions:
 jobs:
   scan:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -23,12 +24,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Prepare config with secrets
-        run: |
-          sed -i "s|\${EMAIL_SENDER}|${{ secrets.EMAIL_SENDER }}|g" config.yaml
-          sed -i "s|\${EMAIL_PASSWORD}|${{ secrets.EMAIL_PASSWORD }}|g" config.yaml
-
       - name: Run monitor
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
         run: python monitor.py
 
       - name: Commit updated seen_jobs.json
