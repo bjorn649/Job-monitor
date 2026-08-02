@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 """
-Freelance Job Monitor
-Checks Dutch freelance platforms for Scrum Master / Agile Coach roles.
+Freelance Job Monitor — GitHub Issue notificatie versie
 """
 
 import json
 import os
 import hashlib
-import smtplib
 import logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -236,57 +233,32 @@ SCRAPERS = {
 }
 
 
-def send_email(new_jobs, config):
-    email_cfg = config["email"]
-    sender = os.environ.get("EMAIL_SENDER", email_cfg["sender"])
-    password = os.environ.get("EMAIL_PASSWORD", email_cfg["password"])
-    recipient = email_cfg["recipient"]
-    smtp_host = email_cfg.get("smtp_host", "smtp.gmail.com")
-    smtp_port = email_cfg.get("smtp_port", 587)
-
+def create_github_issue(new_jobs):
+    """Create a GitHub Issue with new job listings using gh CLI."""
     now = datetime.now(timezone.utc).strftime("%d-%m-%Y %H:%M UTC")
 
-    rows = ""
+    body = f"## 🔔 {len(new_jobs)} nieuwe opdracht(en) gevonden\n"
+    body += f"*Scan uitgevoerd op {now}*\n\n"
+    body += "| Platform | Opdracht |\n|---|---|\n"
+
     for j in new_jobs:
-        rows += f"""
-        <tr>
-            <td style="padding:8px; border-bottom:1px solid #eee;">{j['site']}</td>
-            <td style="padding:8px; border-bottom:1px solid #eee;">
-                <a href="{j['url']}" style="color:#0066cc;">{j['title']}</a>
-            </td>
-        </tr>"""
+        body += f"| {j['site']} | [{j['title']}]({j['url']}) |\n"
 
-    html = f"""
-    <html><body style="font-family: Arial, sans-serif; color:#333;">
-    <h2 style="color:#0066cc;">🔔 {len(new_jobs)} nieuwe opdracht(en) gevonden</h2>
-    <p style="color:#666;">Scan uitgevoerd op {now}</p>
-    <table style="border-collapse:collapse; width:100%; max-width:700px;">
-        <tr style="background:#f5f5f5;">
-            <th style="padding:8px; text-align:left;">Platform</th>
-            <th style="padding:8px; text-align:left;">Opdracht</th>
-        </tr>
-        {rows}
-    </table>
-    <p style="color:#999; font-size:12px; margin-top:20px;">
-        Freelance Job Monitor
-    </p>
-    </body></html>
-    """
+    body += "\n---\n*Freelance Job Monitor*"
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🔔 {len(new_jobs)} nieuwe freelance opdracht(en) — {now}"
-    msg["From"] = sender
-    msg["To"] = recipient
-    msg.attach(MIMEText(html, "html"))
+    title = f"🔔 {len(new_jobs)} nieuwe freelance opdracht(en) — {now}"
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(sender, password)
-            server.sendmail(sender, recipient, msg.as_string())
-        log.info(f"Email sent to {recipient} with {len(new_jobs)} new job(s)")
+        result = subprocess.run(
+            ["gh", "issue", "create", "--title", title, "--body", body],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode == 0:
+            log.info(f"GitHub Issue created: {result.stdout.strip()}")
+        else:
+            log.error(f"Failed to create issue: {result.stderr}")
     except Exception as e:
-        log.error(f"Failed to send email: {e}")
+        log.error(f"Error creating GitHub issue: {e}")
         raise
 
 
@@ -313,36 +285,4 @@ def main():
 
         for job in jobs:
             jid = job_id(job["url"], job["title"])
-            if jid not in seen:
-                seen[jid] = {
-                    "title": job["title"],
-                    "url": job["url"],
-                    "site": job["site"],
-                    "first_seen": datetime.now(timezone.utc).isoformat(),
-                }
-                all_new_jobs.append(job)
-
-    log.info(f"Total new jobs found: {len(all_new_jobs)}")
-
-    if all_new_jobs:
-        send_email(all_new_jobs, config)
-    else:
-        log.info("No new jobs — no email sent.")
-
-    cutoff = datetime.now(timezone.utc).timestamp() - (90 * 86400)
-    pruned = {}
-    for jid, data in seen.items():
-        try:
-            seen_ts = datetime.fromisoformat(data["first_seen"]).timestamp()
-            if seen_ts > cutoff:
-                pruned[jid] = data
-        except (KeyError, ValueError):
-            pruned[jid] = data
-    seen = pruned
-
-    save_seen(seen)
-    log.info(f"Seen database: {len(seen)} jobs tracked")
-
-
-if __name__ == "__main__":
-    main()
+            if jid not in
