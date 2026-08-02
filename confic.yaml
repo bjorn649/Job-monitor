@@ -1,0 +1,24 @@
+keywords:
+  - scrum master
+  - scrummaster
+  - agile coach
+
+sites:
+  - freelance_nl
+  - malt_nl
+  - yacht
+  - brunel
+  - between
+  - quest4
+  - headfirst
+  - striive
+  - freep
+  - flextender
+  - tenderned
+
+email:
+  sender: ${EMAIL_SENDER}
+  password: ${EMAIL_PASSWORD}
+  recipient: bjorngrob1980@gmail.com
+  smtp_host: smtp.gmail.com
+  smtp_port: 587
