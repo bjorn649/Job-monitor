@@ -1,0 +1,40 @@
+name: Freelance Job Monitor
+
+on:
+  schedule:
+    - cron: '0 5-20 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Prepare config with secrets
+        run: |
+          sed -i "s|\${EMAIL_SENDER}|${{ secrets.EMAIL_SENDER }}|g" config.yaml
+          sed -i "s|\${EMAIL_PASSWORD}|${{ secrets.EMAIL_PASSWORD }}|g" config.yaml
+
+      - name: Run monitor
+        run: python monitor.py
+
+      - name: Commit updated seen_jobs.json
+        run: |
+          git config user.name "Job Monitor Bot"
+          git config user.email "bot@github.actions"
+          git add seen_jobs.json
+          git diff --cached --quiet || git commit -m "Update seen_jobs.json [skip ci]"
+          git push
