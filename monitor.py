@@ -285,4 +285,4 @@ def main():
 
         for job in jobs:
             jid = job_id(job["url"], job["title"])
-            if jid not in
+if jid not in seen
