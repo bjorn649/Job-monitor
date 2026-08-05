@@ -142,4 +142,4 @@ SITE_CONFIGS = {
         "name": "Yacht.nl",
         "base_url": "https://www.yacht.nl",
         "search_paths": [
-            "https://www.yacht.nl/vacatures?query={k
+            "https://www.yacht.nl/vacatures?query={kw}",
