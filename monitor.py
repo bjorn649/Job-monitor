@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """
-Freelance Job Monitor v3
+Freelance Job Monitor v4 — Google Search approach
 """
 
 import json
 import os
 import hashlib
 import logging
+import time
+import random
+import re
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs, unquote
 
 import requests
 from bs4 import BeautifulSoup
@@ -28,20 +31,18 @@ CONFIG_FILE = ROOT / "config.yaml"
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/125.0.0.0 Safari/537.36"
+    "Chrome/126.0.0.0 Safari/537.36"
 )
 
-HEADERS = {
+SESSION = requests.Session()
+SESSION.headers.update({
     "User-Agent": UA,
     "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
     "Accept": (
         "text/html,application/xhtml+xml,"
         "application/xml;q=0.9,*/*;q=0.8"
     ),
-}
-
-SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+})
 
 
 def load_config():
@@ -66,185 +67,134 @@ def job_id(url, title):
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def has_keyword(text, keywords):
-    text_lower = text.lower()
-    return any(kw.lower() in text_lower for kw in keywords)
+def clean_google_url(href):
+    """Extract real URL from Google redirect."""
+    if "/url?" in href:
+        parsed = parse_qs(urlparse(href).query)
+        if "q" in parsed:
+            return parsed["q"][0]
+        if "url" in parsed:
+            return parsed["url"][0]
+    if href.startswith("http") and "google" not in href:
+        return href
+    return None
 
 
-SKIP = [
-    "/login", "/register", "/contact",
-    "/over-ons", "/about", "javascript:",
-    "mailto:", "#",
-]
+def google_search(query, num_results=10):
+    """Search Google and return list of {title, url}."""
+    results = []
+    params = {
+        "q": query,
+        "num": num_results,
+        "hl": "nl",
+        "gl": "nl",
+    }
 
-
-def scrape_all_links(site_name, url, base_url, keywords):
-    jobs = []
     try:
-        log.info(f"  Fetching {url}")
-        resp = SESSION.get(url, timeout=30)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-        all_links = soup.find_all("a", href=True)
-        log.info(f"  Found {len(all_links)} total links")
-
-        seen_urls = set()
-        for link in all_links:
-            href = link["href"]
-            if not href or href == "#":
-                continue
-            if href.startswith("javascript"):
-                continue
-            if not href.startswith("http"):
-                href = (
-                    base_url.rstrip("/")
-                    + "/"
-                    + href.lstrip("/")
-                )
-
-            title = link.get_text(strip=True)
-            combined = f"{title} {href}".lower()
-
-            if not has_keyword(combined, keywords):
-                continue
-            if len(title) < 5:
-                slug = href.split("/")[-1]
-                title = slug.replace("-", " ").title()
-            if href in seen_urls:
-                continue
-            seen_urls.add(href)
-
-            if any(p in href.lower() for p in SKIP):
-                continue
-
-            jobs.append({
-                "title": title,
-                "url": href,
-                "site": site_name,
-            })
-            log.info(f"    HIT: {title[:80]}")
-
-    except Exception as e:
-        log.warning(
-            f"  Error scraping {site_name}: {e}"
+        url = "https://www.google.com/search"
+        log.info(f"  Google: {query}")
+        resp = SESSION.get(
+            url, params=params, timeout=30
         )
 
-    log.info(f"  {len(jobs)} job(s) from {site_name}")
-    return jobs
+        if resp.status_code == 429:
+            log.warning("  Google rate limited (429)")
+            return results
+        if resp.status_code != 200:
+            log.warning(
+                f"  Google status: {resp.status_code}"
+            )
+            return results
+
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        for div in soup.find_all("div", class_="g"):
+            a_tag = div.find("a", href=True)
+            if not a_tag:
+                continue
+
+            href = clean_google_url(a_tag["href"])
+            if not href:
+                continue
+
+            h3 = a_tag.find("h3")
+            if h3:
+                title = h3.get_text(strip=True)
+            else:
+                title = a_tag.get_text(strip=True)
+
+            if not title or len(title) < 5:
+                continue
+
+            results.append({
+                "title": title,
+                "url": href,
+            })
+
+        if not results:
+            for a_tag in soup.find_all("a", href=True):
+                href = clean_google_url(a_tag["href"])
+                if not href:
+                    continue
+                if "google" in href:
+                    continue
+
+                h3 = a_tag.find("h3")
+                if not h3:
+                    continue
+                title = h3.get_text(strip=True)
+                if not title or len(title) < 5:
+                    continue
+
+                results.append({
+                    "title": title,
+                    "url": href,
+                })
+
+    except Exception as e:
+        log.warning(f"  Google error: {e}")
+
+    log.info(f"  Got {len(results)} results")
+    return results
 
 
-def scrape_site(name, base_url, paths, keywords):
+SITE_DOMAINS = {
+    "freelance_nl": "freelance.nl",
+    "yacht": "yacht.nl",
+    "brunel": "brunel.net",
+    "between": "between.nl",
+    "quest4": "quest4.nl",
+    "headfirst": "headfirst.group",
+    "striive": "striive.com",
+    "flextender": "flextender.nl",
+    "tenderned": "tenderned.nl",
+    "malt_nl": "malt.nl",
+    "freep": "freep.nl",
+}
+
+
+def search_site(site_key, domain, keywords):
+    """Search Google for jobs on a specific site."""
     all_jobs = []
     seen_urls = set()
+
     for kw in keywords:
-        for tmpl in paths:
-            url = tmpl.replace(
-                "{kw}", quote_plus(kw)
-            )
-            jobs = scrape_all_links(
-                name, url, base_url, keywords
-            )
-            for j in jobs:
-                if j["url"] not in seen_urls:
-                    seen_urls.add(j["url"])
-                    all_jobs.append(j)
+        query = f'site:{domain} "{kw}"'
+        results = google_search(query)
+
+        for r in results:
+            if r["url"] not in seen_urls:
+                seen_urls.add(r["url"])
+                all_jobs.append({
+                    "title": r["title"],
+                    "url": r["url"],
+                    "site": domain,
+                })
+
+        delay = random.uniform(2, 5)
+        time.sleep(delay)
+
     return all_jobs
-
-
-SITES = {
-    "freelance_nl": {
-        "name": "Freelance.nl",
-        "base": "https://www.freelance.nl",
-        "paths": [
-            "https://www.freelance.nl"
-            "/opdrachten"
-            "?query={kw}&sort=date",
-        ],
-    },
-    "malt_nl": {
-        "name": "Malt.nl",
-        "base": "https://www.malt.nl",
-        "paths": [],
-    },
-    "yacht": {
-        "name": "Yacht.nl",
-        "base": "https://www.yacht.nl",
-        "paths": [
-            "https://www.yacht.nl"
-            "/vacatures"
-            "?query={kw}",
-        ],
-    },
-    "brunel": {
-        "name": "Brunel",
-        "base": "https://www.brunel.net",
-        "paths": [
-            "https://www.brunel.net"
-            "/nl-nl/vacatures"
-            "?query={kw}",
-        ],
-    },
-    "between": {
-        "name": "Between.nl",
-        "base": "https://www.between.nl",
-        "paths": [
-            "https://www.between.nl"
-            "/opdrachten"
-            "?search={kw}",
-        ],
-    },
-    "quest4": {
-        "name": "Quest4.nl",
-        "base": "https://www.quest4.nl",
-        "paths": [
-            "https://www.quest4.nl"
-            "/opdrachten"
-            "?q={kw}",
-        ],
-    },
-    "headfirst": {
-        "name": "HeadFirst",
-        "base": "https://www.headfirst.group",
-        "paths": [
-            "https://www.headfirst.group"
-            "/opdrachten"
-            "?q={kw}",
-        ],
-    },
-    "striive": {
-        "name": "Striive",
-        "base": "https://www.striive.com",
-        "paths": [
-            "https://www.striive.com"
-            "/opdrachten"
-            "?q={kw}",
-        ],
-    },
-    "freep": {
-        "name": "Freep.nl",
-        "base": "https://www.freep.nl",
-        "paths": [],
-    },
-    "flextender": {
-        "name": "Flextender",
-        "base": "https://www.flextender.nl",
-        "paths": [
-            "https://www.flextender.nl"
-            "/opdrachten"
-            "?q={kw}",
-        ],
-    },
-    "tenderned": {
-        "name": "TenderNed",
-        "base": "https://www.tenderned.nl",
-        "paths": [
-            "https://www.tenderned.nl"
-            "/aankondigingen/overzicht"
-            "/aankondigingen"
-            "?q={kw}&sort=date",
-        ],
-    },
-}
 
 
 def create_github_issue(new_jobs):
@@ -329,7 +279,7 @@ def main():
         ["scrum master", "agile coach"],
     )
     enabled = config.get(
-        "sites", list(SITES.keys())
+        "sites", list(SITE_DOMAINS.keys())
     )
 
     log.info(f"Keywords: {keywords}")
@@ -338,22 +288,18 @@ def main():
     seen = load_seen()
     all_new = []
 
-    for key in enabled:
-        cfg = SITES.get(key)
-        if not cfg:
-            log.warning(f"Unknown: {key}")
+    for site_key in enabled:
+        domain = SITE_DOMAINS.get(site_key)
+        if not domain:
+            log.warning(f"Unknown: {site_key}")
             continue
 
-        if not cfg["paths"]:
-            log.info(f"Skipping {key} (blocked)")
-            continue
-
-        log.info(f"Scanning {key}...")
-        jobs = scrape_site(
-            cfg["name"],
-            cfg["base"],
-            cfg["paths"],
-            keywords,
+        log.info(f"Scanning {domain}...")
+        jobs = search_site(
+            site_key, domain, keywords
+        )
+        log.info(
+            f"  {len(jobs)} result(s) from {domain}"
         )
 
         for job in jobs:
