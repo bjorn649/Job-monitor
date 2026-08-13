@@ -1,380 +1,225 @@
 #!/usr/bin/env python3
 """
-Freelance Job Monitor
-Checks Dutch freelance platforms for Scrum Master / Agile Coach roles.
-Sends email notification when new jobs are found.
+Freelance Job Monitor v5 — DuckDuckGo Search
 """
 
 import json
 import os
-import re
 import hashlib
-import smtplib
 import logging
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
+import time
+import random
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlparse, parse_qs
 
 import requests
 from bs4 import BeautifulSoup
 import yaml
 
-# ---------------------------------------------------------------------------
-# Setup
-# ---------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s"
+)
 log = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent
 SEEN_FILE = ROOT / "seen_jobs.json"
 CONFIG_FILE = ROOT / "config.yaml"
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/125.0.0.0 Safari/537.36"
-    ),
-    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-}
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/126.0.0.0 Safari/537.36"
+)
 
 SESSION = requests.Session()
-SESSION.headers.update(HEADERS)
+SESSION.headers.update({
+    "User-Agent": UA,
+    "Accept-Language": "nl-NL,nl;q=0.9,en;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,"
+        "application/xml;q=0.9,*/*;q=0.8"
+    ),
+})
 
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
 
 def load_config():
     with open(CONFIG_FILE, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
-def load_seen() -> dict:
+def load_seen():
     if SEEN_FILE.exists():
         with open(SEEN_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     return {}
 
 
-def save_seen(seen: dict):
+def save_seen(seen):
     with open(SEEN_FILE, "w", encoding="utf-8") as f:
         json.dump(seen, f, indent=2, ensure_ascii=False)
 
 
-def job_id(url: str, title: str) -> str:
-    """Create a unique hash for a job based on URL + title."""
+def job_id(url, title):
     raw = f"{url.strip().lower()}|{title.strip().lower()}"
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-def matches_keywords(text: str, keywords: list[str]) -> bool:
-    """Check if any keyword appears in the text (case-insensitive)."""
-    text_lower = text.lower()
-    return any(kw.lower() in text_lower for kw in keywords)
+def ddg_search(query):
+    """Search DuckDuckGo HTML version."""
+    results = []
+    url = "https://html.duckduckgo.com/html/"
 
-
-# ---------------------------------------------------------------------------
-# Site scrapers
-# Each function returns a list of dicts: {title, url, site}
-# ---------------------------------------------------------------------------
-
-def scrape_generic_search(site_name: str, search_url: str, link_selector: str,
-                          title_attr: str = "text", base_url: str = "",
-                          keywords: list[str] | None = None) -> list[dict]:
-    """Generic scraper: fetch page, find links matching a CSS selector."""
-    jobs = []
     try:
-        log.info(f"  Fetching {search_url}")
-        resp = SESSION.get(search_url, timeout=30)
-        resp.raise_for_status()
+        log.info(f"  DDG: {query}")
+        resp = SESSION.post(
+            url,
+            data={"q": query},
+            timeout=30,
+        )
+
+        if resp.status_code != 200:
+            log.warning(f"  DDG status: {resp.status_code}")
+            return results
+
         soup = BeautifulSoup(resp.text, "html.parser")
-        links = soup.select(link_selector)
-        log.info(f"  Found {len(links)} raw links")
 
-        for link in links:
-            href = link.get("href", "")
-            if not href or href == "#":
+        for result in soup.find_all("div", class_="result"):
+            a_tag = result.find("a", class_="result__a")
+            if not a_tag:
                 continue
+
+            href = a_tag.get("href", "")
+
+            if "uddg=" in href:
+                parsed = parse_qs(urlparse(href).query)
+                if "uddg" in parsed:
+                    href = parsed["uddg"][0]
+
             if not href.startswith("http"):
-                href = base_url.rstrip("/") + "/" + href.lstrip("/")
-
-            title = link.get_text(strip=True) if title_attr == "text" else link.get(title_attr, "")
-            if not title:
-                title = href
-
-            # If keywords given, filter; otherwise include all results
-            if keywords and not matches_keywords(title, keywords):
+                continue
+            if "duckduckgo.com" in href:
                 continue
 
-            jobs.append({"title": title, "url": href, "site": site_name})
+            title = a_tag.get_text(strip=True)
+            if not title or len(title) < 5:
+                continue
+
+            results.append({
+                "title": title,
+                "url": href,
+            })
+
     except Exception as e:
-        log.warning(f"  Error scraping {site_name}: {e}")
-    return jobs
+        log.warning(f"  DDG error: {e}")
+
+    log.info(f"  Got {len(results)} results")
+    return results
 
 
-def scrape_freelance_nl(keywords: list[str]) -> list[dict]:
-    """freelance.nl — search per keyword."""
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.freelance.nl/opdrachten?query={quote_plus(kw)}&sort=date"
-        jobs = scrape_generic_search(
-            "Freelance.nl", url,
-            link_selector="a.project-title, a[class*='title'], h2 a, h3 a",
-            base_url="https://www.freelance.nl",
-            keywords=None,  # search already filtered
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_malt_nl(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.malt.nl/s?q={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "Malt.nl", url,
-            link_selector="a[href*='/project/'], a[href*='/profile/']",
-            base_url="https://www.malt.nl",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_yacht(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.yacht.nl/vacatures?q={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "Yacht.nl", url,
-            link_selector="a[href*='/vacatures/'], a[href*='/vacancy/']",
-            base_url="https://www.yacht.nl",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_brunel(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.brunel.net/nl-nl/vacatures?query={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "Brunel", url,
-            link_selector="a[href*='/vacatures/'], a[href*='vacancy']",
-            base_url="https://www.brunel.net",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_between(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.between.nl/opdrachten?search={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "Between.nl", url,
-            link_selector="a[href*='/opdracht'], a[href*='/assignment']",
-            base_url="https://www.between.nl",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_quest4(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.quest4.nl/opdrachten?q={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "Quest4.nl", url,
-            link_selector="a[href*='/opdracht']",
-            base_url="https://www.quest4.nl",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_headfirst(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.headfirst.group/opdrachten?search={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "HeadFirst", url,
-            link_selector="a[href*='/opdracht']",
-            base_url="https://www.headfirst.group",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_striive(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.striive.com/opdrachten?q={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "Striive", url,
-            link_selector="a[href*='/opdracht']",
-            base_url="https://www.striive.com",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_freep(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.freep.nl/opdrachten?search={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "Freep.nl", url,
-            link_selector="a[href*='/opdracht']",
-            base_url="https://www.freep.nl",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_flextender(keywords: list[str]) -> list[dict]:
-    all_jobs = []
-    for kw in keywords:
-        url = f"https://www.flextender.nl/opdrachten?q={quote_plus(kw)}"
-        jobs = scrape_generic_search(
-            "Flextender", url,
-            link_selector="a[href*='/opdracht']",
-            base_url="https://www.flextender.nl",
-            keywords=keywords,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-def scrape_tenderned(keywords: list[str]) -> list[dict]:
-    """TenderNed — Dutch government tenders."""
-    all_jobs = []
-    for kw in keywords:
-        url = (
-            f"https://www.tenderned.nl/aankondigingen/overzicht/aankondigingen"
-            f"?q={quote_plus(kw)}&sort=date"
-        )
-        jobs = scrape_generic_search(
-            "TenderNed", url,
-            link_selector="a[href*='/aankondiging']",
-            base_url="https://www.tenderned.nl",
-            keywords=None,
-        )
-        all_jobs.extend(jobs)
-    return all_jobs
-
-
-# Map site keys to scraper functions
-SCRAPERS = {
-    "freelance_nl": scrape_freelance_nl,
-    "malt_nl": scrape_malt_nl,
-    "yacht": scrape_yacht,
-    "brunel": scrape_brunel,
-    "between": scrape_between,
-    "quest4": scrape_quest4,
-    "headfirst": scrape_headfirst,
-    "striive": scrape_striive,
-    "freep": scrape_freep,
-    "flextender": scrape_flextender,
-    "tenderned": scrape_tenderned,
+SITE_DOMAINS = {
+    "freelance_nl": "freelance.nl",
+    "yacht": "yacht.nl",
+    "brunel": "brunel.net",
+    "between": "between.nl",
+    "quest4": "quest4.nl",
+    "headfirst": "headfirst.group",
+    "striive": "striive.com",
+    "flextender": "flextender.nl",
+    "tenderned": "tenderned.nl",
+    "malt_nl": "malt.nl",
+    "freep": "freep.nl",
 }
 
 
-# ---------------------------------------------------------------------------
-# Email notification
-# ---------------------------------------------------------------------------
+def search_site(domain, keywords):
+    """Search DDG for jobs on a specific site."""
+    all_jobs = []
+    seen_urls = set()
 
-def send_email(new_jobs: list[dict], config: dict):
-    """Send HTML email with new job listings."""
-    email_cfg = config["email"]
-    sender = email_cfg["sender"]
-    password = email_cfg["password"]
-    recipient = email_cfg["recipient"]
-    smtp_host = email_cfg.get("smtp_host", "smtp.gmail.com")
-    smtp_port = email_cfg.get("smtp_port", 587)
+    for kw in keywords:
+        query = f"site:{domain} {kw}"
+        results = ddg_search(query)
+
+        for r in results:
+            if r["url"] not in seen_urls:
+                seen_urls.add(r["url"])
+                all_jobs.append({
+                    "title": r["title"],
+                    "url": r["url"],
+                    "site": domain,
+                })
+
+        delay = random.uniform(3, 6)
+        time.sleep(delay)
+
+    return all_jobs
+
+
+def create_github_issue(new_jobs):
+    token = os.environ.get("GH_TOKEN", "")
+    if not token:
+        token = os.environ.get("GITHUB_TOKEN", "")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+
+    if not token or not repo:
+        log.error("No token/repo — logging only")
+        for j in new_jobs:
+            log.info(f"  NEW: [{j['site']}] {j['title']}")
+        return
 
     now = datetime.now(timezone.utc).strftime("%d-%m-%Y %H:%M UTC")
 
-    # Build HTML body
-    rows = ""
+    body = f"## {len(new_jobs)} nieuwe opdracht(en)\n"
+    body += f"*Scan: {now}*\n\n"
+    body += "| Platform | Opdracht |\n|---|---|\n"
     for j in new_jobs:
-        rows += f"""
-        <tr>
-            <td style="padding:8px; border-bottom:1px solid #eee;">{j['site']}</td>
-            <td style="padding:8px; border-bottom:1px solid #eee;">
-                <a href="{j['url']}" style="color:#0066cc;">{j['title']}</a>
-            </td>
-        </tr>"""
+        body += f"| {j['site']} | [{j['title']}]({j['url']}) |\n"
+    body += "\n---\n*Freelance Job Monitor*"
 
-    html = f"""
-    <html><body style="font-family: Arial, sans-serif; color:#333;">
-    <h2 style="color:#0066cc;">🔔 {len(new_jobs)} nieuwe opdracht(en) gevonden</h2>
-    <p style="color:#666;">Scan uitgevoerd op {now}</p>
-    <table style="border-collapse:collapse; width:100%; max-width:700px;">
-        <tr style="background:#f5f5f5;">
-            <th style="padding:8px; text-align:left;">Platform</th>
-            <th style="padding:8px; text-align:left;">Opdracht</th>
-        </tr>
-        {rows}
-    </table>
-    <p style="color:#999; font-size:12px; margin-top:20px;">
-        Freelance Job Monitor — pas config.yaml aan om sites of zoekwoorden te wijzigen.
-    </p>
-    </body></html>
-    """
+    title = f"{len(new_jobs)} nieuwe opdracht(en) — {now}"
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"🔔 {len(new_jobs)} nieuwe freelance opdracht(en) — {now}"
-    msg["From"] = sender
-    msg["To"] = recipient
-    msg.attach(MIMEText(html, "html"))
+    api_url = f"https://api.github.com/repos/{repo}/issues"
 
     try:
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(sender, password)
-            server.sendmail(sender, recipient, msg.as_string())
-        log.info(f"✅ Email sent to {recipient} with {len(new_jobs)} new job(s)")
+        resp = requests.post(
+            api_url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github+json",
+            },
+            json={"title": title, "body": body},
+            timeout=30,
+        )
+        if resp.status_code == 201:
+            log.info(f"Issue created: {resp.json().get('html_url', 'OK')}")
+        else:
+            log.error(f"Issue failed: {resp.status_code} {resp.text[:200]}")
     except Exception as e:
-        log.error(f"❌ Failed to send email: {e}")
-        raise
+        log.error(f"Error creating issue: {e}")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def main():
     config = load_config()
     keywords = config.get("keywords", ["scrum master", "agile coach"])
-    enabled_sites = config.get("sites", list(SCRAPERS.keys()))
+    enabled = config.get("sites", list(SITE_DOMAINS.keys()))
 
-    log.info(f"Starting scan — keywords: {keywords}")
-    log.info(f"Enabled sites: {enabled_sites}")
+    log.info(f"Keywords: {keywords}")
+    log.info(f"Sites: {enabled}")
 
     seen = load_seen()
-    all_new_jobs = []
+    all_new = []
 
-    for site_key in enabled_sites:
-        scraper = SCRAPERS.get(site_key)
-        if not scraper:
-            log.warning(f"Unknown site key: {site_key}, skipping")
+    for site_key in enabled:
+        domain = SITE_DOMAINS.get(site_key)
+        if not domain:
+            log.warning(f"Unknown: {site_key}")
             continue
 
-        log.info(f"Scanning {site_key}...")
-        jobs = scraper(keywords)
-        log.info(f"  {len(jobs)} matching job(s) from {site_key}")
+        log.info(f"Scanning {domain}...")
+        jobs = search_site(domain, keywords)
+        log.info(f"  {len(jobs)} result(s) from {domain}")
 
         for job in jobs:
             jid = job_id(job["url"], job["title"])
@@ -385,29 +230,28 @@ def main():
                     "site": job["site"],
                     "first_seen": datetime.now(timezone.utc).isoformat(),
                 }
-                all_new_jobs.append(job)
+                all_new.append(job)
 
-    log.info(f"Total new jobs found: {len(all_new_jobs)}")
+    log.info(f"Total new: {len(all_new)}")
 
-    if all_new_jobs:
-        send_email(all_new_jobs, config)
+    if all_new:
+        create_github_issue(all_new)
     else:
-        log.info("No new jobs — no email sent.")
+        log.info("No new jobs.")
 
-    # Prune old entries (keep last 90 days)
     cutoff = datetime.now(timezone.utc).timestamp() - (90 * 86400)
     pruned = {}
     for jid, data in seen.items():
         try:
-            seen_ts = datetime.fromisoformat(data["first_seen"]).timestamp()
-            if seen_ts > cutoff:
+            ts = datetime.fromisoformat(data["first_seen"]).timestamp()
+            if ts > cutoff:
                 pruned[jid] = data
         except (KeyError, ValueError):
-            pruned[jid] = data  # keep if unparseable
+            pruned[jid] = data
     seen = pruned
 
     save_seen(seen)
-    log.info(f"Seen database: {len(seen)} jobs tracked")
+    log.info(f"Database: {len(seen)} jobs tracked")
 
 
 if __name__ == "__main__":
